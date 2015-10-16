@@ -123,6 +123,7 @@ function initGame(game, history) {
   objects.forEach(function(object, i) {
     object.z = i;
   });
+  fixFloatingThingZ();
 
   // replay history
   history.forEach(function(move) {
@@ -210,29 +211,25 @@ function deleteTableAndEverything() {
   objectsById = null;
   usersById = {};
   selectedObjectIdToNewProps = {};
+  consumeNumberModifier();
   // leave the image cache alone
-}
-function bringSelectionToTop() {
-  // effectively do a stable sort.
-  var selection = getEffectiveSelection();
-  var z = findMaxZ(selection);
-  var newPropses = [];
-  for (var id in selection) {
-    newPropses.push(selection[id]);
-  }
-  newPropses.sort(compareZ);
-  newPropses.forEach(function(newProps, i) {
-    newProps.z = z + i + 1;
-  });
-  renderAndMaybeCommitSelection(selection);
 }
 function findMaxZ(excludingSelection) {
   var z = null;
   getObjects().forEach(function(object) {
     if (excludingSelection != null && object.id in excludingSelection) return;
-    if (z == null || object.z > z) z = object.z;
+    var newProps = selectedObjectIdToNewProps[object.id];
+    if (newProps == null) newProps = object;
+    if (z == null || object.z > z) z = newProps.z;
   });
   return z;
+}
+function fixFloatingThingZ() {
+  renderExaminingObjects();
+  var maxZ = findMaxZ(examiningObjectsById) + Object.keys(examiningObjectsById).length;
+  console.log("fix it:", maxZ);
+  document.getElementById("roomInfoDiv").style.zIndex = maxZ + 1;
+  document.getElementById("helpDiv").style.zIndex = maxZ + 2;
 }
 
 var DRAG_NONE = 0;
@@ -257,7 +254,7 @@ var draggingMouseStartX;
 var draggingMouseStartY;
 function onObjectMouseDown(event) {
   if (event.button !== 0) return;
-  if (examiningMode != EXAMINE_NONE) return;
+  if (examiningMode !== EXAMINE_NONE) return;
   var objectDiv = this;
   var object = objectsById[objectDiv.dataset.id];
   if (object.locked) return; // click thee behind me, satan
@@ -266,18 +263,42 @@ function onObjectMouseDown(event) {
 
   // select
   if (selectedObjectIdToNewProps[object.id] == null) {
-    setSelectedObjects([object]);
+    // make a selection
+    var numberModifier = consumeNumberModifier();
+    if (numberModifier == null) numberModifier = 1;
+    if (numberModifier === 1) {
+      setSelectedObjects([object]);
+    } else {
+      var stackId = getStackId(object, object);
+      var stackOfObjects = getObjects().filter(function(object) { return getStackId(object, object) === stackId; });
+      stackOfObjects.sort(compareZ);
+      // we can be pretty sure the object we're clicking is the top.
+      if (numberModifier < stackOfObjects.length) {
+        stackOfObjects.splice(0, stackOfObjects.length - numberModifier);
+      }
+      setSelectedObjects(stackOfObjects);
+    }
   }
 
   // begin drag
   draggingMode = DRAG_MOVE_SELECTION;
   draggingMouseStartX = eventToMouseX(event, tableDiv);
   draggingMouseStartY = eventToMouseY(event, tableDiv);
-  bringSelectionToTop();
 
-  render(object);
-  renderOrder();
-  resizeTableToFitEverything();
+  // bring selection to top
+  // effectively do a stable sort.
+  var selection = selectedObjectIdToNewProps;
+  var newPropses = [];
+  for (var id in selection) {
+    newPropses.push(selection[id]);
+  }
+  newPropses.sort(compareZ);
+  var z = findMaxZ(selection);
+  newPropses.forEach(function(newProps, i) {
+    newProps.z = z + i + 1;
+  });
+  renderAndMaybeCommitSelection(selection);
+  fixFloatingThingZ();
 }
 function onObjectMouseMove(event) {
   if (draggingMode != DRAG_NONE) return;
@@ -298,7 +319,7 @@ tableDiv.addEventListener("mousedown", function(event) {
   if (event.button !== 0) return;
   // clicking the table
   event.preventDefault();
-  if (examiningMode != EXAMINE_NONE) return;
+  if (examiningMode !== EXAMINE_NONE) return;
   draggingMode = DRAG_RECTANGLE_SELECT;
   rectangleSelectStartX = eventToMouseX(event, tableDiv);
   rectangleSelectStartY = eventToMouseY(event, tableDiv);
@@ -474,6 +495,9 @@ function renderAndMaybeCommitSelection(selection) {
   objectsToRender.forEach(render);
   renderOrder();
   resizeTableToFitEverything();
+
+  // it's too late to use this
+  consumeNumberModifier();
 }
 function commitSelection(selection) {
   var move = [];
@@ -537,8 +561,9 @@ document.addEventListener("keydown", function(event) {
       if (modifierMask === 0) { groupSelection(); break; }
       return;
     case 27: // Escape
-      if (draggingMode === DRAG_MOVE_SELECTION && modifierMask === 0) { cancelMove(); break; }
-      if (draggingMode === DRAG_NONE && modifierMask === 0) { setSelectedObjects([]); break; }
+      if (modifierMask === 0 && numberTypingBuffer.length > 0) { consumeNumberModifier(); break; }
+      if (modifierMask === 0 && draggingMode === DRAG_MOVE_SELECTION) { cancelMove(); break; }
+      if (modifierMask === 0 && draggingMode === DRAG_NONE)           { setSelectedObjects([]); break; }
       return;
     case "Z".charCodeAt(0):
       if (draggingMode === DRAG_NONE && modifierMask === CTRL)         { undo(); break; }
@@ -552,6 +577,13 @@ document.addEventListener("keydown", function(event) {
     case 191: // slash/question mark?
       if (modifierMask === SHIFT) { toggleHelp(); break; }
       return;
+
+    case 48: case 49: case 50: case 51: case 52:  case 53:  case 54:  case 55:  case 56:  case 57:  // number keys
+    case 96: case 97: case 98: case 99: case 100: case 101: case 102: case 103: case 104: case 105: // numpad
+      var numberValue = event.keyCode < 96 ? event.keyCode - 48 : event.keyCode - 96;
+      if (modifierMask === 0) { typeNumber(numberValue); break; }
+      return;
+
     default: return;
   }
   event.preventDefault();
@@ -732,27 +764,55 @@ function unexamine() {
   }
   renderOrder();
 }
+
+var numberTypingBuffer = "";
+function typeNumber(numberValue) {
+  numberTypingBuffer += numberValue;
+  renderNumberBuffer();
+}
+function consumeNumberModifier() {
+  if (numberTypingBuffer.length === 0) return null;
+  var result = parseInt(numberTypingBuffer, 10);
+  numberTypingBuffer = "";
+  renderNumberBuffer();
+  return result;
+}
+function clearNumberBuffer() {
+  numberTypingBuffer = "";
+  renderNumberBuffer();
+}
+
 var isHelpShown = true;
+var isHelpMouseIn = false;
 function toggleHelp() {
   isHelpShown = !isHelpShown;
-  if (isHelpShown) {
-    document.getElementById("helpContentsDiv").style.display = "block";
+  renderHelp();
+}
+document.getElementById("helpDiv").addEventListener("mousemove", function() {
+  if (draggingMode !== DRAG_NONE) return;
+  isHelpMouseIn = true;
+  renderHelp();
+});
+document.getElementById("helpDiv").addEventListener("mouseout", function() {
+  isHelpMouseIn = false;
+  renderHelp();
+});
+function renderHelp() {
+  if (isHelpShown || isHelpMouseIn) {
+    document.getElementById("helpDiv").classList.add("helpExpanded");
   } else {
-    document.getElementById("helpContentsDiv").style.display = "none";
+    document.getElementById("helpDiv").classList.remove("helpExpanded");
   }
 }
 
-function undo() {
-  if (changeHistory.length === 0) return;
-  var newMove = reverseChange(changeHistory.pop());
+function undo() { undoOrRedo(changeHistory, futureChanges); }
+function redo() { undoOrRedo(futureChanges, changeHistory); }
+function undoOrRedo(thePast, theFuture) {
+  consumeNumberModifier();
+  if (thePast.length === 0) return;
+  var newMove = reverseChange(thePast.pop());
   sendMessage({cmd:"makeAMove", args:newMove});
-  futureChanges.push(newMove);
-}
-function redo() {
-  if (futureChanges.length === 0) return;
-  var newMove = reverseChange(futureChanges.pop());
-  sendMessage({cmd:"makeAMove", args:newMove});
-  changeHistory.push(newMove);
+  theFuture.push(newMove);
 }
 function reverseChange(move) {
   var newMove = [myUser.id];
@@ -920,7 +980,7 @@ function renderExaminingObjects() {
     objectDiv.style.top  = renderY + window.scrollY;
     objectDiv.style.width  = renderWidth;
     objectDiv.style.height = renderHeight;
-    objectDiv.style.zIndex = maxZ + i;
+    objectDiv.style.zIndex = maxZ + i + 3;
     var stackHeightDiv = getStackHeightDiv(object.id);
     stackHeightDiv.style.display = "none";
   }
@@ -982,6 +1042,15 @@ function renderSelectionRectangle() {
     selectionRectangleDiv.style.display = "block";
   } else {
     selectionRectangleDiv.style.display = "none";
+  }
+}
+function renderNumberBuffer() {
+  var numberBufferDiv = document.getElementById("numberBufferDiv");
+  if (numberTypingBuffer.length !== 0) {
+    numberBufferDiv.textContent = numberTypingBuffer;
+    numberBufferDiv.style.display = "block";
+  } else {
+    numberBufferDiv.style.display = "none";
   }
 }
 function resizeTableToFitEverything() {
